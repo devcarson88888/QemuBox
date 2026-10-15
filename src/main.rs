@@ -21,8 +21,58 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "QemuBox",
         options,
-        Box::new(|_creation_context| Ok(Box::new(QemuBoxApp::new()))),
+        Box::new(|creation_context| {
+            configure_fonts(&creation_context.egui_ctx);
+            Ok(Box::new(QemuBoxApp::new()))
+        }),
     )
+}
+
+fn configure_fonts(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for path in cjk_font_paths() {
+        if let Ok(data) = fs::read(path) {
+            let name = "system_cjk".to_owned();
+            fonts
+                .font_data
+                .insert(name.clone(), egui::FontData::from_owned(data).into());
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, name.clone());
+            }
+            context.set_fonts(fonts);
+            return;
+        }
+    }
+    eprintln!("QemuBox: no supported CJK font found; Chinese text may not display.");
+}
+
+#[cfg(windows)]
+fn cjk_font_paths() -> &'static [&'static str] {
+    &[
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\Deng.ttf",
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn cjk_font_paths() -> &'static [&'static str] {
+    &[
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+    ]
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn cjk_font_paths() -> &'static [&'static str] {
+    &[
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]

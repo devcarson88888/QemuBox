@@ -15,6 +15,8 @@ starting or stopping QEMU processes.
 ## Requirements
 
 - Rust and Cargo (1.85 or newer).
+- A system CJK font for Chinese interface text (Windows: SimHei or Dengxian;
+  Linux/macOS: Noto Sans CJK or an equivalent installed font).
 - QEMU installed separately. Either add `qemu-system-x86_64` to `PATH` or
   choose its executable in the app.
 - A QEMU-supported disk image. QemuBox uses `virtio` for the configured disk.
