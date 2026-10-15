@@ -144,6 +144,14 @@ struct QemuBoxApp {
     draft: VmConfig,
     running: HashMap<u128, RunningVm>,
     notice: Option<(String, bool)>,
+    page: AppPage,
+    search_query: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppPage {
+    Home,
+    Editor,
 }
 
 impl QemuBoxApp {
@@ -167,6 +175,8 @@ impl QemuBoxApp {
             draft,
             running: HashMap::new(),
             notice,
+            page: AppPage::Home,
+            search_query: String::new(),
         }
     }
 
@@ -205,6 +215,38 @@ impl QemuBoxApp {
     fn add_vm(&mut self) {
         self.draft = VmConfig::new();
         self.selected_id = Some(self.draft.id);
+        self.page = AppPage::Editor;
+    }
+
+    fn import_vm(&mut self) {
+        let Some(path) = Self::pick_file("", &["json"]) else {
+            return;
+        };
+        let result = fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|contents| {
+                serde_json::from_str::<VmConfig>(&contents).map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(mut vm) => {
+                if let Some(existing) = self.vms.iter_mut().find(|item| item.id == vm.id) {
+                    *existing = vm.clone();
+                } else {
+                    vm.id = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    self.vms.push(vm.clone());
+                }
+                self.selected_id = Some(vm.id);
+                self.draft = vm;
+                self.page = AppPage::Editor;
+                self.save_all();
+            }
+            Err(error) => {
+                self.notice = Some((format!("打开虚拟机配置失败：{error}"), true));
+            }
+        }
     }
 
     fn start_vm(&mut self, vm: &VmConfig) {
@@ -292,15 +334,108 @@ impl eframe::App for QemuBoxApp {
         self.refresh_processes();
         context.request_repaint_after(Duration::from_secs(1));
 
-        egui::TopBottomPanel::top("header").show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("QemuBox");
-                ui.label("Rust QEMU 虚拟机管理器");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("＋ 新建虚拟机").clicked() {
+        egui::TopBottomPanel::top("workstation_menu").show(context, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("文件(F)", |ui| {
+                    if ui.button("新建虚拟机…").clicked() {
                         self.add_vm();
+                        ui.close_menu();
+                    }
+                    if ui.button("打开虚拟机…").clicked() {
+                        self.import_vm();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("退出").clicked() {
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                ui.menu_button("编辑(E)", |ui| {
+                    if ui.button("虚拟机设置…").clicked() {
+                        self.page = AppPage::Editor;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("查看(V)", |ui| {
+                    if ui.button("主页").clicked() {
+                        self.page = AppPage::Home;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("虚拟机(M)", |ui| {
+                    if let Some(id) = self.selected_id {
+                        if !self.running.contains_key(&id) && ui.button("启动").clicked() {
+                            let vm = self.vms.iter().find(|vm| vm.id == id).cloned();
+                            if let Some(vm) = vm {
+                                self.start_vm(&vm);
+                            }
+                            ui.close_menu();
+                        }
+                        if self.running.contains_key(&id) && ui.button("关闭").clicked() {
+                            self.stop_vm(id);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("帮助(H)", |ui| {
+                    ui.label("QemuBox - QEMU 虚拟机管理器");
+                });
+            });
+        });
+
+        egui::TopBottomPanel::top("workstation_toolbar").show(context, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("＋ 新建").clicked() {
+                    self.add_vm();
+                }
+                if ui.button("↗ 打开").clicked() {
+                    self.import_vm();
+                }
+                ui.separator();
+                let selected_running = self
+                    .selected_id
+                    .map(|id| self.running.contains_key(&id))
+                    .unwrap_or(false);
+                if selected_running {
+                    if ui.button("■ 停止").clicked() {
+                        if let Some(id) = self.selected_id {
+                            self.stop_vm(id);
+                        }
+                    }
+                } else if let Some(id) = self.selected_id {
+                    if ui.button("▶ 启动").clicked() {
+                        let vm = self.vms.iter().find(|vm| vm.id == id).cloned();
+                        if let Some(vm) = vm {
+                            self.start_vm(&vm);
+                        }
+                    }
+                }
+            });
+        });
+
+        egui::TopBottomPanel::top("workstation_tabs").show(context, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(self.page == AppPage::Home, "⌂ 主页")
+                    .clicked()
+                {
+                    self.page = AppPage::Home;
+                }
+                if self.page == AppPage::Editor {
+                    let tab_title = self
+                        .vms
+                        .iter()
+                        .find(|vm| Some(vm.id) == self.selected_id)
+                        .map(|vm| vm.name.as_str())
+                        .unwrap_or(&self.draft.name)
+                        .to_owned();
+                    if ui
+                        .selectable_label(true, format!("▣ {tab_title}"))
+                        .clicked()
+                    {
+                        self.page = AppPage::Editor;
+                    }
+                }
             });
         });
 
@@ -308,37 +443,84 @@ impl eframe::App for QemuBoxApp {
             .resizable(true)
             .default_width(250.0)
             .show(context, |ui| {
-                ui.heading("虚拟机");
-                ui.separator();
-                if self.vms.is_empty() {
-                    ui.label("还没有虚拟机，点击“新建虚拟机”开始配置。");
-                }
-
-                let vms = self.vms.clone();
-                for vm in vms {
-                    ui.horizontal(|ui| {
-                        let is_running = self.running.contains_key(&vm.id);
-                        let selected = self.selected_id == Some(vm.id);
-                        let marker = if is_running { "●" } else { "○" };
-                        if ui
-                            .selectable_label(selected, format!("{marker} {}", vm.name))
-                            .clicked()
-                        {
-                            self.selected_id = Some(vm.id);
-                            self.draft = vm.clone();
-                        }
-                        if is_running {
-                            if ui.small_button("停止").clicked() {
-                                self.stop_vm(vm.id);
-                            }
-                        } else if ui.small_button("启动").clicked() {
-                            self.start_vm(&vm);
+                ui.horizontal(|ui| {
+                    ui.heading("库");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("＋").on_hover_text("新建虚拟机").clicked() {
+                            self.add_vm();
                         }
                     });
-                }
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("⌕ 搜索虚拟机")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.separator();
+                ui.collapsing("我的计算机", |ui| {
+                    if self.vms.is_empty() {
+                        ui.label("虚拟机将显示在这里");
+                    }
+
+                    let vms = self.vms.clone();
+                    for vm in vms.into_iter().filter(|vm| {
+                        vm.name
+                            .to_lowercase()
+                            .contains(&self.search_query.to_lowercase())
+                    }) {
+                        ui.horizontal(|ui| {
+                            let is_running = self.running.contains_key(&vm.id);
+                            let selected =
+                                self.selected_id == Some(vm.id) && self.page == AppPage::Editor;
+                            let marker = if is_running { "●" } else { "▣" };
+                            if ui
+                                .selectable_label(selected, format!("{marker} {}", vm.name))
+                                .clicked()
+                            {
+                                self.selected_id = Some(vm.id);
+                                self.draft = vm.clone();
+                                self.page = AppPage::Editor;
+                            }
+                        });
+                    }
+                });
             });
 
         egui::CentralPanel::default().show(context, |ui| {
+            if self.page == AppPage::Home {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(32.0);
+                    ui.heading(egui::RichText::new("QemuBox").size(32.0).strong());
+                    ui.label("Rust QEMU 虚拟机工作站");
+                    ui.add_space(28.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 540.0).max(0.0) / 2.0);
+                        if home_action_card(ui, "⊕", "创建新的虚拟机", "配置硬件并安装操作系统")
+                        {
+                            self.add_vm();
+                        }
+                        if home_action_card(ui, "↗", "打开虚拟机", "导入已有的虚拟机配置")
+                        {
+                            self.import_vm();
+                        }
+                        if home_action_card(ui, "⇄", "连接远程服务器", "远程连接暂未支持")
+                        {
+                            self.notice = Some(("远程 QEMU 连接功能正在开发中".to_owned(), false));
+                        }
+                    });
+                    if let Some((message, is_error)) = &self.notice {
+                        ui.add_space(24.0);
+                        let color = if *is_error {
+                            egui::Color32::from_rgb(240, 100, 100)
+                        } else {
+                            egui::Color32::from_rgb(120, 190, 145)
+                        };
+                        ui.colored_label(color, message);
+                    }
+                });
+                return;
+            }
+
             ui.heading("虚拟机配置");
             ui.label("设置 QEMU 程序、计算资源和启动介质。");
             ui.add_space(12.0);
@@ -472,6 +654,22 @@ impl eframe::App for QemuBoxApp {
             ui.label("提示：QEMU 需要单独安装并加入 PATH，或在上方指定其可执行文件。");
         });
     }
+}
+
+fn home_action_card(ui: &mut egui::Ui, icon: &str, title: &str, subtitle: &str) -> bool {
+    let button = egui::Button::new(
+        egui::RichText::new(format!("{icon}\n\n{title}\n{subtitle}"))
+            .size(16.0)
+            .color(egui::Color32::WHITE),
+    )
+    .fill(egui::Color32::from_rgb(42, 42, 42))
+    .stroke(egui::Stroke::new(
+        1.0_f32,
+        egui::Color32::from_rgb(55, 55, 55),
+    ))
+    .corner_radius(egui::CornerRadius::same(6))
+    .min_size(egui::vec2(164.0, 132.0));
+    ui.add(button).clicked()
 }
 
 fn config_file_path() -> PathBuf {
