@@ -12,6 +12,9 @@ virtual machine library.
 - Save VM definitions between launches.
 - Start and stop configured instances and view their running status.
 - Choose between `qcow2` and `raw` virtual disk formats.
+- Create VMs through a Typical wizard that selects an ISO and creates a
+  virtual disk, or a Custom wizard for machine type, acceleration, networking,
+  and additional QEMU arguments.
 - Import a saved virtual machine configuration from a JSON file.
 - Connect to remote Linux hosts over SSH and manage libvirt VMs.
 
@@ -22,6 +25,8 @@ virtual machine library.
   Linux/macOS: Noto Sans CJK or an equivalent installed font).
 - QEMU installed separately. Either add `qemu-system-x86_64` to `PATH` or
   choose its executable in the app.
+- The Typical VM wizard also requires `qemu-img` on `PATH` to create virtual
+  disks.
 - For remote management, OpenSSH must be available on the local `PATH`, and
   the remote Linux host must have `virsh`/libvirt installed. Configure SSH
   public-key authentication and libvirt permissions for the remote user.

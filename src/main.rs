@@ -16,12 +16,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 720.0])
             .with_min_inner_size([780.0, 560.0])
-            .with_title("QemuBox"),
+            .with_title("QemuBox Workstation Pro"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "QemuBox",
+        "QemuBox Workstation Pro",
         options,
         Box::new(|creation_context| {
             configure_fonts(&creation_context.egui_ctx);
@@ -39,11 +39,7 @@ fn configure_fonts(context: &egui::Context) {
                 .font_data
                 .insert(name.clone(), egui::FontData::from_owned(data).into());
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .insert(0, name.clone());
+                fonts.families.entry(family).or_default().push(name.clone());
             }
             context.set_fonts(fonts);
             return;
@@ -103,6 +99,14 @@ struct VmConfig {
     disk_path: String,
     disk_format: DiskFormat,
     iso_path: String,
+    #[serde(default = "default_machine_type")]
+    machine_type: String,
+    #[serde(default = "default_acceleration")]
+    acceleration: String,
+    #[serde(default = "default_network_enabled")]
+    network_enabled: bool,
+    #[serde(default)]
+    additional_qemu_args: String,
 }
 
 impl VmConfig {
@@ -121,8 +125,24 @@ impl VmConfig {
             disk_path: String::new(),
             disk_format: DiskFormat::Qcow2,
             iso_path: String::new(),
+            machine_type: default_machine_type().to_owned(),
+            acceleration: default_acceleration().to_owned(),
+            network_enabled: true,
+            additional_qemu_args: String::new(),
         }
     }
+}
+
+fn default_machine_type() -> String {
+    "q35".to_owned()
+}
+
+fn default_acceleration() -> String {
+    "tcg".to_owned()
+}
+
+fn default_network_enabled() -> bool {
+    true
 }
 
 #[cfg(windows)]
@@ -148,6 +168,7 @@ struct QemuBoxApp {
     notice: Option<(String, bool)>,
     page: AppPage,
     search_query: String,
+    create_vm_draft: Option<CreateVmDraft>,
     remote_config_file: PathBuf,
     remote_servers: Vec<RemoteServer>,
     remote_draft: RemoteServer,
@@ -164,6 +185,30 @@ enum AppPage {
     Editor,
     RemoteConnect,
     Remote,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateVmMode {
+    Typical,
+    Custom,
+}
+
+struct CreateVmDraft {
+    vm: VmConfig,
+    mode: Option<CreateVmMode>,
+    disk_path: String,
+    disk_size_gib: u32,
+    disk_created: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CreateVmAction {
+    Cancel,
+    Back,
+    Save,
+    Start,
+    Typical,
+    Custom,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -233,6 +278,7 @@ impl QemuBoxApp {
             notice,
             page: AppPage::Home,
             search_query: String::new(),
+            create_vm_draft: None,
             remote_config_file,
             remote_servers,
             remote_draft,
@@ -277,9 +323,58 @@ impl QemuBoxApp {
     }
 
     fn add_vm(&mut self) {
-        self.draft = VmConfig::new();
-        self.selected_id = Some(self.draft.id);
-        self.page = AppPage::Editor;
+        self.create_vm_draft = Some(CreateVmDraft {
+            vm: VmConfig::new(),
+            mode: None,
+            disk_path: String::new(),
+            disk_size_gib: 40,
+            disk_created: false,
+        });
+    }
+
+    fn finish_create_vm(&mut self, start_after_save: bool) {
+        let Some(mut draft) = self.create_vm_draft.take() else {
+            return;
+        };
+        let vm = &mut draft.vm;
+        if vm.name.trim().is_empty() {
+            self.notice = Some(("虚拟机名称不能为空".to_owned(), true));
+            self.create_vm_draft = Some(draft);
+            return;
+        }
+        if draft.mode == Some(CreateVmMode::Typical) {
+            vm.disk_path = draft.disk_path.trim().to_owned();
+            if vm.disk_path.is_empty() || vm.iso_path.trim().is_empty() {
+                self.notice = Some((
+                    "典型安装需要选择 ISO 镜像和虚拟磁盘保存位置。".to_owned(),
+                    true,
+                ));
+                self.create_vm_draft = Some(draft);
+                return;
+            }
+            if !draft.disk_created {
+                match create_virtual_disk(vm, draft.disk_size_gib) {
+                    Ok(()) => draft.disk_created = true,
+                    Err(error) => {
+                        self.notice = Some((format!("创建虚拟磁盘失败：{error}"), true));
+                        self.create_vm_draft = Some(draft);
+                        return;
+                    }
+                }
+            }
+        }
+
+        let vm = draft.vm;
+        self.vms.push(vm.clone());
+        if self.save_all() {
+            if start_after_save {
+                self.start_vm(&vm);
+            }
+        } else {
+            self.vms.retain(|saved| saved.id != vm.id);
+            draft.vm = vm;
+            self.create_vm_draft = Some(draft);
+        }
     }
 
     fn import_vm(&mut self) {
@@ -563,13 +658,13 @@ impl eframe::App for QemuBoxApp {
 
         egui::TopBottomPanel::top("workstation_toolbar").show(context, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("＋ 新建").clicked() {
+                if ui.button("新建").clicked() {
                     self.add_vm();
                 }
-                if ui.button("↗ 打开").clicked() {
+                if ui.button("打开").clicked() {
                     self.import_vm();
                 }
-                if ui.button("⇄ 连接服务器").clicked() {
+                if ui.button("连接服务器").clicked() {
                     self.remote_draft = RemoteServer {
                         id: 0,
                         name: String::new(),
@@ -585,13 +680,13 @@ impl eframe::App for QemuBoxApp {
                     .map(|id| self.running.contains_key(&id))
                     .unwrap_or(false);
                 if selected_running {
-                    if ui.button("■ 停止").clicked() {
+                    if ui.button("停止").clicked() {
                         if let Some(id) = self.selected_id {
                             self.stop_vm(id);
                         }
                     }
                 } else if let Some(id) = self.selected_id {
-                    if ui.button("▶ 启动").clicked() {
+                    if ui.button("启动").clicked() {
                         let vm = self.vms.iter().find(|vm| vm.id == id).cloned();
                         if let Some(vm) = vm {
                             self.start_vm(&vm);
@@ -604,7 +699,7 @@ impl eframe::App for QemuBoxApp {
         egui::TopBottomPanel::top("workstation_tabs").show(context, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .selectable_label(self.page == AppPage::Home, "⌂ 主页")
+                    .selectable_label(self.page == AppPage::Home, "Home")
                     .clicked()
                 {
                     self.page = AppPage::Home;
@@ -617,11 +712,11 @@ impl eframe::App for QemuBoxApp {
                         .map(|vm| vm.name.as_str())
                         .unwrap_or(&self.draft.name)
                         .to_owned();
-                    if ui
-                        .selectable_label(true, format!("▣ {tab_title}"))
-                        .clicked()
-                    {
+                    if ui.selectable_label(true, tab_title).clicked() {
                         self.page = AppPage::Editor;
+                    }
+                    if ui.small_button("x").on_hover_text("关闭标签").clicked() {
+                        self.page = AppPage::Home;
                     }
                 }
             });
@@ -629,49 +724,48 @@ impl eframe::App for QemuBoxApp {
 
         egui::SidePanel::left("vm_list")
             .resizable(true)
-            .default_width(250.0)
+            .default_width(180.0)
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("库");
+                    ui.heading("My Computer");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("＋").on_hover_text("新建虚拟机").clicked() {
+                        if ui.small_button("+").on_hover_text("新建虚拟机").clicked() {
                             self.add_vm();
                         }
                     });
                 });
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("⌕ 搜索虚拟机")
+                        .hint_text("搜索虚拟机")
                         .desired_width(f32::INFINITY),
                 );
                 ui.separator();
-                ui.collapsing("我的计算机", |ui| {
-                    if self.vms.is_empty() {
-                        ui.label("虚拟机将显示在这里");
-                    }
+                if self.vms.is_empty() {
+                    ui.label("虚拟机将显示在这里");
+                }
 
-                    let vms = self.vms.clone();
-                    for vm in vms.into_iter().filter(|vm| {
-                        vm.name
-                            .to_lowercase()
-                            .contains(&self.search_query.to_lowercase())
-                    }) {
-                        ui.horizontal(|ui| {
-                            let is_running = self.running.contains_key(&vm.id);
-                            let selected =
-                                self.selected_id == Some(vm.id) && self.page == AppPage::Editor;
-                            let marker = if is_running { "●" } else { "▣" };
-                            if ui
-                                .selectable_label(selected, format!("{marker} {}", vm.name))
-                                .clicked()
-                            {
-                                self.selected_id = Some(vm.id);
-                                self.draft = vm.clone();
-                                self.page = AppPage::Editor;
-                            }
-                        });
+                let vms = self.vms.clone();
+                for vm in vms.into_iter().filter(|vm| {
+                    vm.name
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                }) {
+                    let is_running = self.running.contains_key(&vm.id);
+                    let selected = self.selected_id == Some(vm.id) && self.page == AppPage::Editor;
+                    let marker = if is_running {
+                        "[运行]"
+                    } else {
+                        "[虚拟机]"
+                    };
+                    if ui
+                        .selectable_label(selected, format!("{marker} {}", vm.name))
+                        .clicked()
+                    {
+                        self.selected_id = Some(vm.id);
+                        self.draft = vm.clone();
+                        self.page = AppPage::Editor;
                     }
-                });
+                }
                 ui.collapsing("远程服务器", |ui| {
                     if self.remote_servers.is_empty() {
                         ui.label("尚未保存服务器");
@@ -682,14 +776,14 @@ impl eframe::App for QemuBoxApp {
                             .selectable_label(
                                 self.active_remote.as_ref().map(|item| item.id) == Some(server.id)
                                     && self.page == AppPage::Remote,
-                                format!("⇄ {}", server.name),
+                                server.name.clone(),
                             )
                             .clicked()
                         {
                             self.connect_remote(server);
                         }
                     }
-                    if ui.button("＋ 添加服务器").clicked() {
+                    if ui.button("+ 添加服务器").clicked() {
                         self.remote_draft = RemoteServer {
                             id: 0,
                             name: String::new(),
@@ -704,42 +798,76 @@ impl eframe::App for QemuBoxApp {
 
         egui::CentralPanel::default().show(context, |ui| {
             if self.page == AppPage::Home {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(32.0);
-                    ui.heading(egui::RichText::new("QemuBox").size(32.0).strong());
-                    ui.label("Rust QEMU 虚拟机工作站");
-                    ui.add_space(28.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space((ui.available_width() - 540.0).max(0.0) / 2.0);
-                        if home_action_card(ui, "⊕", "创建新的虚拟机", "配置硬件并安装操作系统")
-                        {
-                            self.add_vm();
-                        }
-                        if home_action_card(ui, "↗", "打开虚拟机", "导入已有的虚拟机配置")
-                        {
-                            self.import_vm();
-                        }
-                        if home_action_card(ui, "⇄", "连接远程服务器", "通过 SSH 管理 libvirt")
-                        {
-                            self.remote_draft = RemoteServer {
-                                id: 0,
-                                name: String::new(),
-                                host: String::new(),
-                                username: String::new(),
-                                port: 22,
+                ui.vertical(|ui| {
+                    ui.add_space(54.0);
+                    ui.vertical_centered(|ui| {
+                        ui.heading(
+                            egui::RichText::new("QemuBox WORKSTATION PRO v0.01 (Alpha)")
+                                .size(29.0)
+                                .strong(),
+                        );
+                        ui.add_space(32.0);
+
+                        let card_gap = 18.0;
+                        let available = ui.available_width();
+                        let card_width = ((available - card_gap * 2.0) / 3.0).clamp(150.0, 230.0);
+                        let row_width = card_width * 3.0 + card_gap * 2.0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(((available - row_width) / 2.0).max(0.0));
+                            if home_action_card(
+                                ui,
+                                HomeIcon::Create,
+                                "创建新的虚拟机",
+                                "配置硬件并安装系统",
+                                card_width,
+                            ) {
+                                self.add_vm();
+                            }
+                            ui.add_space(card_gap);
+                            if home_action_card(
+                                ui,
+                                HomeIcon::Open,
+                                "打开虚拟机",
+                                "导入已有的虚拟机配置",
+                                card_width,
+                            ) {
+                                self.import_vm();
+                            }
+                            ui.add_space(card_gap);
+                            if home_action_card(
+                                ui,
+                                HomeIcon::Connect,
+                                "连接远程服务器",
+                                "通过 SSH 管理 libvirt",
+                                card_width,
+                            ) {
+                                self.remote_draft = RemoteServer {
+                                    id: 0,
+                                    name: String::new(),
+                                    host: String::new(),
+                                    username: String::new(),
+                                    port: 22,
+                                };
+                                self.page = AppPage::RemoteConnect;
+                            }
+                        });
+                        if let Some((message, is_error)) = &self.notice {
+                            ui.add_space(20.0);
+                            let color = if *is_error {
+                                egui::Color32::from_rgb(190, 45, 45)
+                            } else {
+                                egui::Color32::from_rgb(45, 130, 75)
                             };
-                            self.page = AppPage::RemoteConnect;
+                            ui.colored_label(color, message);
                         }
                     });
-                    if let Some((message, is_error)) = &self.notice {
-                        ui.add_space(24.0);
-                        let color = if *is_error {
-                            egui::Color32::from_rgb(240, 100, 100)
-                        } else {
-                            egui::Color32::from_rgb(120, 190, 145)
-                        };
-                        ui.colored_label(color, message);
-                    }
+                    ui.with_layout(
+                        egui::Layout::bottom_up(egui::Align::LEFT),
+                        |ui| {
+                            ui.add_space(8.0);
+                            ui.small("QemuBox Workstation Pro · Alpha");
+                        },
+                    );
                 });
                 return;
             }
@@ -972,6 +1100,43 @@ impl eframe::App for QemuBoxApp {
                         }
                     });
                     ui.end_row();
+
+                    ui.label("虚拟机框架");
+                    egui::ComboBox::from_id_salt("edit_machine_type")
+                        .selected_text(&self.draft.machine_type)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.draft.machine_type, "q35".to_owned(), "q35");
+                            ui.selectable_value(&mut self.draft.machine_type, "pc".to_owned(), "i440fx / pc");
+                        });
+                    ui.end_row();
+
+                    ui.label("硬件加速");
+                    egui::ComboBox::from_id_salt("edit_acceleration")
+                        .selected_text(&self.draft.acceleration)
+                        .show_ui(ui, |ui| {
+                            for accelerator in ["tcg", "kvm", "whpx", "hvf"] {
+                                ui.selectable_value(
+                                    &mut self.draft.acceleration,
+                                    accelerator.to_owned(),
+                                    accelerator,
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("网络");
+                    ui.checkbox(&mut self.draft.network_enabled, "启用用户模式网络");
+                    ui.end_row();
+                });
+
+                ui.collapsing("高级 QEMU 参数", |ui| {
+                    ui.label("可填写额外参数，以空格分隔；参数会直接传给 QEMU，不经过命令行解释器。");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.draft.additional_qemu_args)
+                            .desired_width(500.0)
+                            .desired_rows(3)
+                            .hint_text("-device virtio-vga"),
+                    );
                 });
 
             ui.add_space(18.0);
@@ -1017,23 +1182,483 @@ impl eframe::App for QemuBoxApp {
             ui.separator();
             ui.label("提示：QEMU 需要单独安装并加入 PATH，或在上方指定其可执行文件。");
         });
+
+        if self.create_vm_draft.is_some() {
+            let mut open = true;
+            let mut action = None;
+            let mode = self.create_vm_draft.as_ref().and_then(|draft| draft.mode);
+            let title = match mode {
+                None => "新建虚拟机",
+                Some(CreateVmMode::Typical) => "新建虚拟机 - 典型",
+                Some(CreateVmMode::Custom) => "新建虚拟机 - 自定义",
+            };
+            egui::Window::new(title)
+                .id(egui::Id::new("create_vm_dialog"))
+                .collapsible(false)
+                .resizable(false)
+                .default_width(if mode == Some(CreateVmMode::Custom) {
+                    620.0
+                } else {
+                    520.0
+                })
+                .open(&mut open)
+                .show(context, |ui| {
+                    let Some(draft) = self.create_vm_draft.as_mut() else {
+                        return;
+                    };
+                    match draft.mode {
+                        None => {
+                            ui.heading("选择虚拟机创建方式");
+                            ui.label("请选择安装向导的引导方式。之后仍可调整硬件设置。");
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(230.0);
+                                    ui.heading("典型");
+                                    ui.label("使用推荐的 QEMU 硬件配置。选择系统 ISO，自动创建虚拟磁盘。");
+                                    ui.add_space(8.0);
+                                    if ui.button("典型 (推荐)").clicked() {
+                                        action = Some(CreateVmAction::Typical);
+                                    }
+                                });
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    ui.set_width(230.0);
+                                    ui.heading("自定义");
+                                    ui.label("手动选择机器类型、硬件加速、网络和额外 QEMU 参数。");
+                                    ui.add_space(8.0);
+                                    if ui.button("自定义 (高级)").clicked() {
+                                        action = Some(CreateVmAction::Custom);
+                                    }
+                                });
+                            });
+                        }
+                        Some(CreateVmMode::Typical) => {
+                            ui.label("选择安装介质并为虚拟机创建一个新的 qcow2 磁盘。");
+                            ui.add_space(12.0);
+                            egui::Grid::new("typical_vm_config")
+                                .num_columns(2)
+                                .spacing([12.0, 14.0])
+                                .show(ui, |ui| {
+                                    ui.label("虚拟机名称");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.vm.name)
+                                            .desired_width(330.0)
+                                            .hint_text("例如：Ubuntu"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("安装 ISO");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut draft.vm.iso_path)
+                                                .desired_width(235.0)
+                                                .hint_text("选择操作系统镜像"),
+                                        );
+                                        if ui.button("浏览…").clicked() {
+                                            if let Some(path) =
+                                                Self::pick_file(&draft.vm.iso_path, &["iso"])
+                                            {
+                                                draft.vm.iso_path = path;
+                                                if draft.vm.name == "新建虚拟机" {
+                                                    if let Some(stem) =
+                                                        Path::new(&draft.vm.iso_path).file_stem()
+                                                    {
+                                                        draft.vm.name =
+                                                            stem.to_string_lossy().into_owned();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("虚拟磁盘");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut draft.disk_path)
+                                                .desired_width(235.0)
+                                                .hint_text("选择保存位置"),
+                                        );
+                                        if ui.button("浏览…").clicked() {
+                                            let default_file = format!(
+                                                "{}.qcow2",
+                                                draft.vm.name.replace(
+                                                    ['<', '>', ':', '"', '/', '\\', '|', '?', '*'],
+                                                    "_"
+                                                )
+                                            );
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("QEMU qcow2 磁盘", &["qcow2"])
+                                                .set_file_name(default_file)
+                                                .save_file()
+                                            {
+                                                draft.disk_path =
+                                                    path.to_string_lossy().into_owned();
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("磁盘容量");
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.disk_size_gib)
+                                            .range(1..=2048)
+                                            .suffix(" GiB"),
+                                    );
+                                    ui.end_row();
+                                });
+                            ui.add_space(10.0);
+                            ui.label("推荐配置：q35、TCG 软件加速、virtio 磁盘和用户模式网络。");
+                            ui.add_space(14.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("上一步").clicked() {
+                                    action = Some(CreateVmAction::Back);
+                                }
+                                if ui.button("取消").clicked() {
+                                    action = Some(CreateVmAction::Cancel);
+                                }
+                                if ui.button("创建虚拟机").clicked() {
+                                    action = Some(CreateVmAction::Save);
+                                }
+                                if ui.button("创建并启动").clicked() {
+                                    action = Some(CreateVmAction::Start);
+                                }
+                            });
+                        }
+                        Some(CreateVmMode::Custom) => {
+                            ui.label("选择 QEMU 机器框架、加速器和虚拟设备，也可以添加原生 QEMU 参数。");
+                            ui.add_space(10.0);
+                            egui::Grid::new("custom_vm_config")
+                                .num_columns(2)
+                                .spacing([12.0, 10.0])
+                                .show(ui, |ui| {
+                                    ui.label("名称");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.vm.name)
+                                            .desired_width(380.0)
+                                            .hint_text("例如：开发测试机"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("QEMU 程序");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut draft.vm.qemu_path)
+                                                .desired_width(290.0)
+                                                .hint_text(default_qemu_path()),
+                                        );
+                                        if ui.button("浏览…").clicked() {
+                                            if let Some(path) =
+                                                Self::pick_file(&draft.vm.qemu_path, &["exe", ""])
+                                            {
+                                                draft.vm.qemu_path = path;
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("内存");
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.vm.memory_mib)
+                                            .range(128..=1_048_576)
+                                            .suffix(" MiB"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("CPU 核心数");
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.vm.cpus).range(1..=256),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("机器框架");
+                                    egui::ComboBox::from_id_salt("wizard_machine_type")
+                                        .selected_text(&draft.vm.machine_type)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut draft.vm.machine_type,
+                                                "q35".to_owned(),
+                                                "q35 (PCIe)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut draft.vm.machine_type,
+                                                "pc".to_owned(),
+                                                "i440fx / pc",
+                                            );
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("硬件加速");
+                                    egui::ComboBox::from_id_salt("wizard_acceleration")
+                                        .selected_text(&draft.vm.acceleration)
+                                        .show_ui(ui, |ui| {
+                                            for accelerator in ["tcg", "kvm", "whpx", "hvf"] {
+                                                ui.selectable_value(
+                                                    &mut draft.vm.acceleration,
+                                                    accelerator.to_owned(),
+                                                    accelerator,
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("虚拟磁盘");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut draft.vm.disk_path)
+                                                .desired_width(290.0)
+                                                .hint_text("选择已有镜像"),
+                                        );
+                                        if ui.button("浏览…").clicked() {
+                                            if let Some(path) = Self::pick_file(
+                                                &draft.vm.disk_path,
+                                                &["qcow2", "img", "raw"],
+                                            ) {
+                                                draft.vm.disk_path = path;
+                                            }
+                                        }
+                                        egui::ComboBox::from_id_salt("wizard_disk_format")
+                                            .selected_text(draft.vm.disk_format.label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut draft.vm.disk_format,
+                                                    DiskFormat::Qcow2,
+                                                    "qcow2",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut draft.vm.disk_format,
+                                                    DiskFormat::Raw,
+                                                    "raw",
+                                                );
+                                            });
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("安装 ISO");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut draft.vm.iso_path)
+                                                .desired_width(290.0)
+                                                .hint_text("可选"),
+                                        );
+                                        if ui.button("浏览…").clicked() {
+                                            if let Some(path) =
+                                                Self::pick_file(&draft.vm.iso_path, &["iso"])
+                                            {
+                                                draft.vm.iso_path = path;
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("网络设备");
+                                    ui.checkbox(
+                                        &mut draft.vm.network_enabled,
+                                        "用户模式网络 (NAT)",
+                                    );
+                                    ui.end_row();
+                                });
+                            ui.collapsing("额外 QEMU 参数", |ui| {
+                                ui.label("直接追加到 QEMU 命令；以空格分隔，不支持带空格的单个参数值。");
+                                ui.add(
+                                    egui::TextEdit::multiline(
+                                        &mut draft.vm.additional_qemu_args,
+                                    )
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(3)
+                                    .hint_text("-device virtio-vga"),
+                                );
+                            });
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("上一步").clicked() {
+                                    action = Some(CreateVmAction::Back);
+                                }
+                                if ui.button("取消").clicked() {
+                                    action = Some(CreateVmAction::Cancel);
+                                }
+                                if ui.button("完成").clicked() {
+                                    action = Some(CreateVmAction::Save);
+                                }
+                                if ui.button("完成并启动").clicked() {
+                                    action = Some(CreateVmAction::Start);
+                                }
+                            });
+                        }
+                    }
+                });
+            match action {
+                Some(CreateVmAction::Cancel) => self.create_vm_draft = None,
+                Some(CreateVmAction::Back) => {
+                    if let Some(draft) = self.create_vm_draft.as_mut() {
+                        draft.mode = None;
+                    }
+                }
+                Some(CreateVmAction::Typical) => {
+                    if let Some(draft) = self.create_vm_draft.as_mut() {
+                        draft.mode = Some(CreateVmMode::Typical);
+                    }
+                }
+                Some(CreateVmAction::Custom) => {
+                    if let Some(draft) = self.create_vm_draft.as_mut() {
+                        draft.mode = Some(CreateVmMode::Custom);
+                    }
+                }
+                Some(CreateVmAction::Save) => self.finish_create_vm(false),
+                Some(CreateVmAction::Start) => self.finish_create_vm(true),
+                None if !open => self.create_vm_draft = None,
+                None => {}
+            }
+        }
     }
 }
 
-fn home_action_card(ui: &mut egui::Ui, icon: &str, title: &str, subtitle: &str) -> bool {
-    let button = egui::Button::new(
-        egui::RichText::new(format!("{icon}\n\n{title}\n{subtitle}"))
-            .size(16.0)
-            .color(egui::Color32::WHITE),
-    )
-    .fill(egui::Color32::from_rgb(42, 42, 42))
-    .stroke(egui::Stroke::new(
-        1.0_f32,
-        egui::Color32::from_rgb(55, 55, 55),
-    ))
-    .corner_radius(egui::CornerRadius::same(6))
-    .min_size(egui::vec2(164.0, 132.0));
-    ui.add(button).clicked()
+#[derive(Clone, Copy)]
+enum HomeIcon {
+    Create,
+    Open,
+    Connect,
+}
+
+fn home_action_card(
+    ui: &mut egui::Ui,
+    icon: HomeIcon,
+    title: &str,
+    subtitle: &str,
+    width: f32,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 176.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        egui::Color32::from_rgb(58, 58, 58)
+    } else {
+        egui::Color32::from_rgb(38, 38, 38)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(2.0_f32, egui::Color32::BLACK),
+        egui::StrokeKind::Inside,
+    );
+    let center = rect.center();
+    let white = egui::Color32::WHITE;
+    let painter = ui.painter();
+    let icon_center = egui::pos2(center.x, rect.top() + 50.0);
+    let icon_stroke = egui::Stroke::new(3.0_f32, white);
+    match icon {
+        HomeIcon::Create => {
+            painter.circle_stroke(icon_center, 21.0, icon_stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(icon_center.x - 11.0, icon_center.y),
+                    egui::pos2(icon_center.x + 11.0, icon_center.y),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_center.x, icon_center.y - 11.0),
+                    egui::pos2(icon_center.x, icon_center.y + 11.0),
+                ],
+                icon_stroke,
+            );
+        }
+        HomeIcon::Open => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(
+                    egui::pos2(icon_center.x - 7.0, icon_center.y + 6.0),
+                    egui::vec2(38.0, 38.0),
+                ),
+                egui::CornerRadius::ZERO,
+                icon_stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_center.x - 1.0, icon_center.y + 8.0),
+                    egui::pos2(icon_center.x + 18.0, icon_center.y - 12.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_center.x + 5.0, icon_center.y - 12.0),
+                    egui::pos2(icon_center.x + 18.0, icon_center.y - 12.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_center.x + 18.0, icon_center.y - 12.0),
+                    egui::pos2(icon_center.x + 18.0, icon_center.y + 1.0),
+                ],
+                icon_stroke,
+            );
+        }
+        HomeIcon::Connect => {
+            let left = icon_center.x - 22.0;
+            let right = icon_center.x + 22.0;
+            painter.line_segment(
+                [
+                    egui::pos2(left, icon_center.y - 8.0),
+                    egui::pos2(right, icon_center.y - 8.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right - 8.0, icon_center.y - 16.0),
+                    egui::pos2(right, icon_center.y - 8.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right, icon_center.y - 8.0),
+                    egui::pos2(right - 8.0, icon_center.y),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right, icon_center.y + 8.0),
+                    egui::pos2(left, icon_center.y + 8.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(left + 8.0, icon_center.y),
+                    egui::pos2(left, icon_center.y + 8.0),
+                ],
+                icon_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(left, icon_center.y + 8.0),
+                    egui::pos2(left + 8.0, icon_center.y + 16.0),
+                ],
+                icon_stroke,
+            );
+        }
+    }
+    ui.painter().text(
+        egui::pos2(center.x, rect.top() + 112.0),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(17.0),
+        white,
+    );
+    ui.painter().text(
+        egui::pos2(center.x, rect.top() + 143.0),
+        egui::Align2::CENTER_CENTER,
+        subtitle,
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_gray(205),
+    );
+    response.clicked()
 }
 
 fn config_file_path() -> PathBuf {
@@ -1208,6 +1833,12 @@ fn run_remote_virsh(server: &RemoteServer, action: RemoteCommand) -> Result<Vec<
 
 fn build_qemu_args(vm: &VmConfig) -> Vec<String> {
     let mut args = vec![
+        "-machine".to_owned(),
+        format!(
+            "type={},accel={}",
+            vm.machine_type.trim(),
+            vm.acceleration.trim()
+        ),
         "-name".to_owned(),
         vm.name.clone(),
         "-m".to_owned(),
@@ -1226,7 +1857,59 @@ fn build_qemu_args(vm: &VmConfig) -> Vec<String> {
         args.push(vm.iso_path.clone());
         args.extend(["-boot".to_owned(), "order=d".to_owned()]);
     }
+    if vm.network_enabled {
+        args.extend([
+            "-netdev".to_owned(),
+            "user,id=net0".to_owned(),
+            "-device".to_owned(),
+            "virtio-net-pci,netdev=net0".to_owned(),
+        ]);
+    }
+    args.extend(
+        vm.additional_qemu_args
+            .split_whitespace()
+            .map(str::to_owned),
+    );
     args
+}
+
+fn create_virtual_disk(vm: &VmConfig, size_gib: u32) -> Result<(), String> {
+    let path = Path::new(&vm.disk_path);
+    if path.exists() {
+        return Err(format!("目标文件已存在：{}", path.display()));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建目录：{error}"))?;
+    }
+
+    let output = Command::new(default_qemu_img_path())
+        .args(["create", "-f", "qcow2"])
+        .arg(path)
+        .arg(format!("{size_gib}G"))
+        .output()
+        .map_err(|error| format!("无法运行 qemu-img：{error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "qemu-img 退出码 {:?}：{}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn default_qemu_img_path() -> &'static str {
+    "qemu-img.exe"
+}
+
+#[cfg(not(windows))]
+fn default_qemu_img_path() -> &'static str {
+    "qemu-img"
 }
 
 #[cfg(test)]
@@ -1244,11 +1927,17 @@ mod tests {
             disk_path: "C:\\VMs\\disk,qcow2".to_owned(),
             disk_format: DiskFormat::Qcow2,
             iso_path: "C:\\ISOs\\linux.iso".to_owned(),
+            machine_type: "q35".to_owned(),
+            acceleration: "tcg".to_owned(),
+            network_enabled: true,
+            additional_qemu_args: String::new(),
         };
 
         assert_eq!(
             build_qemu_args(&vm),
             [
+                "-machine",
+                "type=q35,accel=tcg",
                 "-name",
                 "Test VM",
                 "-m",
@@ -1261,6 +1950,10 @@ mod tests {
                 "C:\\ISOs\\linux.iso",
                 "-boot",
                 "order=d",
+                "-netdev",
+                "user,id=net0",
+                "-device",
+                "virtio-net-pci,netdev=net0",
             ]
         );
     }
@@ -1271,6 +1964,42 @@ mod tests {
         vm.disk_path = "disk.raw".to_owned();
         vm.disk_format = DiskFormat::Raw;
         assert!(!build_qemu_args(&vm).iter().any(|arg| arg == "-cdrom"));
+        assert!(build_qemu_args(&vm).iter().any(|arg| arg == "-machine"));
+    }
+
+    #[test]
+    fn adds_custom_qemu_arguments_and_can_disable_network() {
+        let mut vm = VmConfig::new();
+        vm.additional_qemu_args = "-device virtio-vga -display none".to_owned();
+        vm.network_enabled = false;
+        let args = build_qemu_args(&vm);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-device", "virtio-vga"]));
+        assert!(args.iter().any(|arg| arg == "-display"));
+        assert!(!args.iter().any(|arg| arg == "-netdev"));
+    }
+
+    #[test]
+    fn loads_legacy_vm_config_with_default_hardware_options() {
+        let vm: VmConfig = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "name": "Legacy VM",
+                "qemu_path": "qemu-system-x86_64",
+                "memory_mib": 1024,
+                "cpus": 1,
+                "disk_path": "disk.qcow2",
+                "disk_format": "Qcow2",
+                "iso_path": ""
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(vm.machine_type, "q35");
+        assert_eq!(vm.acceleration, "tcg");
+        assert!(vm.network_enabled);
+        assert!(vm.additional_qemu_args.is_empty());
     }
 
     #[test]
