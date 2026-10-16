@@ -2,7 +2,9 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -146,12 +148,50 @@ struct QemuBoxApp {
     notice: Option<(String, bool)>,
     page: AppPage,
     search_query: String,
+    remote_config_file: PathBuf,
+    remote_servers: Vec<RemoteServer>,
+    remote_draft: RemoteServer,
+    active_remote: Option<RemoteServer>,
+    remote_vms: Vec<RemoteVm>,
+    remote_busy: bool,
+    remote_sender: Sender<RemoteResult>,
+    remote_receiver: Receiver<RemoteResult>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppPage {
     Home,
     Editor,
+    RemoteConnect,
+    Remote,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RemoteServer {
+    id: u128,
+    name: String,
+    host: String,
+    username: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteVm {
+    uuid: String,
+    name: String,
+    state: String,
+}
+
+enum RemoteCommand {
+    Refresh,
+    Start(String),
+    Shutdown(String),
+}
+
+struct RemoteResult {
+    server: RemoteServer,
+    output: Result<Vec<RemoteVm>, String>,
+    completion_message: String,
 }
 
 impl QemuBoxApp {
@@ -167,6 +207,22 @@ impl QemuBoxApp {
         };
         let draft = vms.first().cloned().unwrap_or_else(VmConfig::new);
         let selected_id = vms.first().map(|vm| vm.id);
+        let remote_config_file = remote_config_file_path();
+        let remote_servers = match load_remote_servers(&remote_config_file) {
+            Ok(servers) => servers,
+            Err(error) => {
+                notice = Some((format!("读取远程服务器配置失败：{error}"), true));
+                Vec::new()
+            }
+        };
+        let remote_draft = RemoteServer {
+            id: 0,
+            name: String::new(),
+            host: String::new(),
+            username: String::new(),
+            port: 22,
+        };
+        let (remote_sender, remote_receiver) = mpsc::channel();
 
         Self {
             config_file,
@@ -177,6 +233,14 @@ impl QemuBoxApp {
             notice,
             page: AppPage::Home,
             search_query: String::new(),
+            remote_config_file,
+            remote_servers,
+            remote_draft,
+            active_remote: None,
+            remote_vms: Vec::new(),
+            remote_busy: false,
+            remote_sender,
+            remote_receiver,
         }
     }
 
@@ -246,6 +310,108 @@ impl QemuBoxApp {
             Err(error) => {
                 self.notice = Some((format!("打开虚拟机配置失败：{error}"), true));
             }
+        }
+    }
+
+    fn connect_remote(&mut self, mut server: RemoteServer) {
+        if self.remote_busy {
+            return;
+        }
+        server.host = server.host.trim().to_owned();
+        server.username = server.username.trim().to_owned();
+        if !valid_ssh_server(&server) {
+            self.notice = Some(("请填写有效的主机地址、用户名和 SSH 端口。".to_owned(), true));
+            return;
+        }
+        if server.name.trim().is_empty() {
+            server.name = format!("{}@{}", server.username, server.host);
+        }
+        if server.id == 0 {
+            server.id = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+        }
+
+        self.remote_busy = true;
+        self.notice = Some((format!("正在通过 SSH 连接 {}…", server.host), false));
+        self.run_remote_command(server, RemoteCommand::Refresh);
+    }
+
+    fn run_remote_command(&self, server: RemoteServer, action: RemoteCommand) {
+        let sender = self.remote_sender.clone();
+        let completion_message = match &action {
+            RemoteCommand::Refresh => "已连接并刷新".to_owned(),
+            RemoteCommand::Start(_) => "启动命令已完成".to_owned(),
+            RemoteCommand::Shutdown(_) => "安全关机命令已完成".to_owned(),
+        };
+        thread::spawn(move || {
+            let output = run_remote_virsh(&server, action);
+            let _ = sender.send(RemoteResult {
+                server,
+                output,
+                completion_message,
+            });
+        });
+    }
+
+    fn poll_remote_results(&mut self) {
+        loop {
+            match self.remote_receiver.try_recv() {
+                Ok(result) => {
+                    self.remote_busy = false;
+                    match result.output {
+                        Ok(vms) => {
+                            if let Some(profile) = self
+                                .remote_servers
+                                .iter_mut()
+                                .find(|item| item.id == result.server.id)
+                            {
+                                *profile = result.server.clone();
+                            } else {
+                                self.remote_servers.push(result.server.clone());
+                            }
+                            self.active_remote = Some(result.server.clone());
+                            self.remote_vms = vms;
+                            self.page = AppPage::Remote;
+                            self.notice = Some((
+                                format!(
+                                    "{}：{}，找到 {} 台虚拟机",
+                                    result.completion_message,
+                                    result.server.name,
+                                    self.remote_vms.len()
+                                ),
+                                false,
+                            ));
+                            if let Err(error) =
+                                save_remote_servers(&self.remote_config_file, &self.remote_servers)
+                            {
+                                self.notice =
+                                    Some((format!("已连接，但保存服务器配置失败：{error}"), true));
+                            }
+                        }
+                        Err(error) => {
+                            self.notice = Some((format!("远程操作失败：{error}"), true));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.remote_busy = false;
+                    self.notice = Some(("远程连接工作线程已退出".to_owned(), true));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn request_remote_command(&mut self, action: RemoteCommand) {
+        if self.remote_busy {
+            return;
+        }
+        if let Some(server) = self.active_remote.clone() {
+            self.remote_busy = true;
+            self.run_remote_command(server, action);
         }
     }
 
@@ -332,6 +498,7 @@ impl QemuBoxApp {
 impl eframe::App for QemuBoxApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_processes();
+        self.poll_remote_results();
         context.request_repaint_after(Duration::from_secs(1));
 
         egui::TopBottomPanel::top("workstation_menu").show(context, |ui| {
@@ -343,6 +510,17 @@ impl eframe::App for QemuBoxApp {
                     }
                     if ui.button("打开虚拟机…").clicked() {
                         self.import_vm();
+                        ui.close_menu();
+                    }
+                    if ui.button("连接远程服务器…").clicked() {
+                        self.remote_draft = RemoteServer {
+                            id: 0,
+                            name: String::new(),
+                            host: String::new(),
+                            username: String::new(),
+                            port: 22,
+                        };
+                        self.page = AppPage::RemoteConnect;
                         ui.close_menu();
                     }
                     ui.separator();
@@ -390,6 +568,16 @@ impl eframe::App for QemuBoxApp {
                 }
                 if ui.button("↗ 打开").clicked() {
                     self.import_vm();
+                }
+                if ui.button("⇄ 连接服务器").clicked() {
+                    self.remote_draft = RemoteServer {
+                        id: 0,
+                        name: String::new(),
+                        host: String::new(),
+                        username: String::new(),
+                        port: 22,
+                    };
+                    self.page = AppPage::RemoteConnect;
                 }
                 ui.separator();
                 let selected_running = self
@@ -484,6 +672,34 @@ impl eframe::App for QemuBoxApp {
                         });
                     }
                 });
+                ui.collapsing("远程服务器", |ui| {
+                    if self.remote_servers.is_empty() {
+                        ui.label("尚未保存服务器");
+                    }
+                    let servers = self.remote_servers.clone();
+                    for server in servers {
+                        if ui
+                            .selectable_label(
+                                self.active_remote.as_ref().map(|item| item.id) == Some(server.id)
+                                    && self.page == AppPage::Remote,
+                                format!("⇄ {}", server.name),
+                            )
+                            .clicked()
+                        {
+                            self.connect_remote(server);
+                        }
+                    }
+                    if ui.button("＋ 添加服务器").clicked() {
+                        self.remote_draft = RemoteServer {
+                            id: 0,
+                            name: String::new(),
+                            host: String::new(),
+                            username: String::new(),
+                            port: 22,
+                        };
+                        self.page = AppPage::RemoteConnect;
+                    }
+                });
             });
 
         egui::CentralPanel::default().show(context, |ui| {
@@ -503,9 +719,16 @@ impl eframe::App for QemuBoxApp {
                         {
                             self.import_vm();
                         }
-                        if home_action_card(ui, "⇄", "连接远程服务器", "远程连接暂未支持")
+                        if home_action_card(ui, "⇄", "连接远程服务器", "通过 SSH 管理 libvirt")
                         {
-                            self.notice = Some(("远程 QEMU 连接功能正在开发中".to_owned(), false));
+                            self.remote_draft = RemoteServer {
+                                id: 0,
+                                name: String::new(),
+                                host: String::new(),
+                                username: String::new(),
+                                port: 22,
+                            };
+                            self.page = AppPage::RemoteConnect;
                         }
                     });
                     if let Some((message, is_error)) = &self.notice {
@@ -518,6 +741,147 @@ impl eframe::App for QemuBoxApp {
                         ui.colored_label(color, message);
                     }
                 });
+                return;
+            }
+
+            if self.page == AppPage::RemoteConnect {
+                ui.heading("连接远程服务器");
+                ui.label("使用 SSH 密钥连接 Linux 主机，并通过 libvirt 管理虚拟机。");
+                ui.add_space(18.0);
+                egui::Grid::new("remote_connection")
+                    .num_columns(2)
+                    .spacing([12.0, 14.0])
+                    .show(ui, |ui| {
+                        ui.label("连接名称");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.remote_draft.name)
+                                .hint_text("可选，例如：家用服务器")
+                                .desired_width(280.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("主机地址");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.remote_draft.host)
+                                .hint_text("例如：192.168.1.20")
+                                .desired_width(280.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("SSH 用户名");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.remote_draft.username)
+                                .hint_text("Linux 用户名")
+                                .desired_width(280.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("SSH 端口");
+                        ui.add(egui::DragValue::new(&mut self.remote_draft.port).range(1..=65535));
+                        ui.end_row();
+                    });
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    let connect = ui.add_enabled(!self.remote_busy, egui::Button::new("连接"));
+                    if connect.clicked() {
+                        self.connect_remote(self.remote_draft.clone());
+                    }
+                    if ui.button("取消").clicked() {
+                        self.page = AppPage::Home;
+                    }
+                });
+                ui.add_space(12.0);
+                ui.label("要求：本机可使用 ssh 命令；远程 Linux 主机已配置 SSH 公钥登录及 libvirt/virsh。");
+                ui.label("密码不会由 QemuBox 保存或传输，请使用 SSH 密钥或 ssh-agent。");
+                if let Some((message, is_error)) = &self.notice {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        if *is_error {
+                            egui::Color32::from_rgb(240, 100, 100)
+                        } else {
+                            egui::Color32::from_rgb(120, 190, 145)
+                        },
+                        message,
+                    );
+                }
+                return;
+            }
+
+            if self.page == AppPage::Remote {
+                let server_name = self
+                    .active_remote
+                    .as_ref()
+                    .map(|server| server.name.clone())
+                    .unwrap_or_else(|| "远程服务器".to_owned());
+                ui.horizontal(|ui| {
+                    ui.heading(server_name);
+                    if ui
+                        .add_enabled(!self.remote_busy, egui::Button::new("刷新"))
+                        .clicked()
+                    {
+                        self.request_remote_command(RemoteCommand::Refresh);
+                    }
+                    if self.remote_busy {
+                        ui.spinner();
+                        ui.label("正在执行远程操作…");
+                    }
+                });
+                ui.label("通过 SSH 管理此主机上的 libvirt 虚拟机。");
+                ui.separator();
+                if self.remote_vms.is_empty() && !self.remote_busy {
+                    ui.label("没有找到虚拟机，或该主机上的 libvirt 尚未配置虚拟机。");
+                }
+                let remote_vms = self.remote_vms.clone();
+                for vm in remote_vms {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(&vm.name);
+                                ui.label(format!("UUID: {}", vm.uuid));
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(&vm.state);
+                                    if vm.state.eq_ignore_ascii_case("running") {
+                                        if ui
+                                            .add_enabled(
+                                                !self.remote_busy,
+                                                egui::Button::new("安全关机"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.request_remote_command(RemoteCommand::Shutdown(
+                                                vm.uuid.clone(),
+                                            ));
+                                        }
+                                    } else if ui
+                                        .add_enabled(
+                                            !self.remote_busy,
+                                            egui::Button::new("启动"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.request_remote_command(RemoteCommand::Start(
+                                            vm.uuid.clone(),
+                                        ));
+                                    }
+                                },
+                            );
+                        });
+                    });
+                }
+                if let Some((message, is_error)) = &self.notice {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        if *is_error {
+                            egui::Color32::from_rgb(240, 100, 100)
+                        } else {
+                            egui::Color32::from_rgb(120, 190, 145)
+                        },
+                        message,
+                    );
+                }
                 return;
             }
 
@@ -679,6 +1043,13 @@ fn config_file_path() -> PathBuf {
         .join("vms.json")
 }
 
+fn remote_config_file_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("QemuBox")
+        .join("remote-servers.json")
+}
+
 fn load_vms(path: &Path) -> Result<Vec<VmConfig>, Box<dyn std::error::Error>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -694,6 +1065,145 @@ fn save_vms(path: &Path, vms: &[VmConfig]) -> Result<(), Box<dyn std::error::Err
     let contents = serde_json::to_string_pretty(vms)?;
     fs::write(path, contents)?;
     Ok(())
+}
+
+fn load_remote_servers(path: &Path) -> Result<Vec<RemoteServer>, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&contents)?)
+}
+
+fn save_remote_servers(
+    path: &Path,
+    servers: &[RemoteServer],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let contents = serde_json::to_string_pretty(servers)?;
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn valid_ssh_server(server: &RemoteServer) -> bool {
+    !server.host.is_empty()
+        && server
+            .host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+        && !server.username.is_empty()
+        && server
+            .username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && server.port > 0
+}
+
+fn valid_domain_uuid(uuid: &str) -> bool {
+    uuid.len() == 36
+        && uuid.chars().enumerate().all(|(index, character)| {
+            if [8, 13, 18, 23].contains(&index) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn run_ssh(server: &RemoteServer, remote_command: &str) -> Result<Output, String> {
+    if !valid_ssh_server(server) {
+        return Err("服务器地址或用户名无效".to_owned());
+    }
+    let target = format!("{}@{}", server.username, server.host);
+    let output = Command::new("ssh")
+        .args([
+            "-p",
+            &server.port.to_string(),
+            "-oBatchMode=yes",
+            "-oConnectTimeout=10",
+            "-oServerAliveInterval=5",
+            "-oServerAliveCountMax=2",
+            &target,
+            remote_command,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "找不到 ssh 命令，请安装 OpenSSH 客户端并将 ssh 加入 PATH。".to_owned()
+            } else {
+                format!("无法启动 SSH：{error}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let message = if stderr.is_empty() {
+            format!("SSH 命令退出，状态码：{}", output.status)
+        } else {
+            stderr
+        };
+        return Err(message);
+    }
+    Ok(output)
+}
+
+fn run_remote_virsh(server: &RemoteServer, action: RemoteCommand) -> Result<Vec<RemoteVm>, String> {
+    let action_command = match action {
+        RemoteCommand::Refresh => None,
+        RemoteCommand::Start(uuid) => {
+            if !valid_domain_uuid(&uuid) {
+                return Err("虚拟机 UUID 无效".to_owned());
+            }
+            Some(format!("virsh start {uuid}"))
+        }
+        RemoteCommand::Shutdown(uuid) => {
+            if !valid_domain_uuid(&uuid) {
+                return Err("虚拟机 UUID 无效".to_owned());
+            }
+            Some(format!("virsh shutdown {uuid}"))
+        }
+    };
+
+    if let Some(command) = action_command {
+        run_ssh(server, &command)?;
+    }
+
+    let output = run_ssh(server, "virsh list --all --uuid")?;
+    let uuids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    let mut vms = Vec::with_capacity(uuids.len());
+    for uuid in uuids {
+        if !valid_domain_uuid(&uuid) {
+            return Err("远程 virsh 返回了无效的虚拟机 UUID".to_owned());
+        }
+        let output = run_ssh(server, &format!("virsh dominfo {uuid}"))?;
+        let info = String::from_utf8_lossy(&output.stdout);
+        let mut name = None;
+        let mut state = None;
+        for line in info.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                match key.trim() {
+                    "Name" => name = Some(value.trim().to_owned()),
+                    "State" => state = Some(value.trim().to_owned()),
+                    _ => {}
+                }
+            }
+        }
+        vms.push(RemoteVm {
+            uuid,
+            name: name.ok_or_else(|| "virsh dominfo 未返回虚拟机名称".to_owned())?,
+            state: state.ok_or_else(|| "virsh dominfo 未返回虚拟机状态".to_owned())?,
+        });
+    }
+    Ok(vms)
 }
 
 fn build_qemu_args(vm: &VmConfig) -> Vec<String> {
@@ -761,5 +1271,29 @@ mod tests {
         vm.disk_path = "disk.raw".to_owned();
         vm.disk_format = DiskFormat::Raw;
         assert!(!build_qemu_args(&vm).iter().any(|arg| arg == "-cdrom"));
+    }
+
+    #[test]
+    fn accepts_only_well_formed_domain_uuids() {
+        assert!(valid_domain_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!valid_domain_uuid("virsh; rm -rf /"));
+        assert!(!valid_domain_uuid("550e8400-e29b-41d4-a716-44665544000z"));
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters_in_remote_connection_fields() {
+        let mut server = RemoteServer {
+            id: 1,
+            name: "test".to_owned(),
+            host: "example.com".to_owned(),
+            username: "user.name".to_owned(),
+            port: 22,
+        };
+        assert!(valid_ssh_server(&server));
+        server.host = "example.com;whoami".to_owned();
+        assert!(!valid_ssh_server(&server));
+        server.host = "example.com".to_owned();
+        server.username = "user;whoami".to_owned();
+        assert!(!valid_ssh_server(&server));
     }
 }
